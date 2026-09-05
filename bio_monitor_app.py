@@ -14,6 +14,7 @@ Intern: [Your Name]
 Program: Stimulus Group Services -- Bio-Engineering & Technology Internship
 """
 
+import math
 import time
 
 import pandas as pd
@@ -83,6 +84,8 @@ STATE_COLORS = {
     DATA_ERROR: "#5a6470",
 }
 
+DEMO_ID = "DEMO-CRISIS"
+
 
 # ---------------------------------------------------------------------------
 # Alert engine  (verbatim from Week 2 -- verified against 18 test cases)
@@ -149,6 +152,105 @@ def classify_vitals(heart_rate, oxygen_saturation):
         return _result(WARNING, triggers, hr, spo2)
 
     return _result(NORMAL, [], hr, spo2)
+
+
+# ---------------------------------------------------------------------------
+# Week 2 test suite, runnable from the dashboard
+#
+# The same 18 cases from Week2_AlertLogic.ipynb, running against the function
+# above rather than a copy of it. Boundary cases matter most: the difference
+# between "> 120" and ">= 120" is invisible in ordinary data but would
+# misclassify every patient sitting exactly on the threshold.
+# ---------------------------------------------------------------------------
+
+TEST_CASES = [
+    (75, 98, NORMAL, "Healthy adult at rest"),
+    (60, 95, NORMAL, "Boundary: both exactly at the normal limit"),
+    (100, 95, NORMAL, "Boundary: exactly 100 bpm is not yet elevated"),
+    (110, 97, WARNING, "Mild tachycardia"),
+    (55, 97, WARNING, "Mild bradycardia"),
+    (75, 93, WARNING, "Mild desaturation"),
+    (120, 98, WARNING, "Boundary: exactly 120 is warning, not critical"),
+    (50, 98, WARNING, "Boundary: exactly 50 is warning, not critical"),
+    (85, 91, WARNING, "Borderline SpO2 WITHOUT tachycardia"),
+    (121, 98, PRIORITY_1, "Severe tachycardia, one bpm over the line"),
+    (49, 98, PRIORITY_1, "Severe bradycardia, one bpm under the line"),
+    (80, 87, PRIORITY_1, "Severe hypoxia, heart rate normal"),
+    (105, 91, PRIORITY_1, "COMPOUND: borderline SpO2 WITH tachycardia"),
+    (135, 84, PRIORITY_1, "Multiple simultaneous triggers"),
+    (None, 98, DATA_ERROR, "Missing heart rate"),
+    (75, None, DATA_ERROR, "Missing saturation"),
+    (75, 150, DATA_ERROR, "Impossible saturation (>100%)"),
+    (0, 98, DATA_ERROR, "Heart rate of zero - detached lead"),
+]
+
+
+def run_test_suite():
+    """Return (results_dataframe, passed, total)."""
+    rows, passed = [], 0
+    for hr, spo2, expected, desc in TEST_CASES:
+        actual = classify_vitals(hr, spo2)["status"]
+        ok = actual == expected
+        passed += ok
+        rows.append({
+            "HR": "-" if hr is None else hr,
+            "SpO2": "-" if spo2 is None else spo2,
+            "Expected": expected,
+            "Actual": actual,
+            "Result": "PASS" if ok else "FAIL",
+            "What it checks": desc,
+        })
+    return pd.DataFrame(rows), passed, len(TEST_CASES)
+
+
+# ---------------------------------------------------------------------------
+# Demo patient
+#
+# The Kaggle dataset is drawn almost entirely from stable patients, so loading
+# it alone can produce zero Priority 1 events - which means the emergency state
+# never appears on screen. This generates one synthetic deteriorating patient so
+# the alert path can actually be demonstrated. It is clearly labelled in the UI
+# and is not part of the source data.
+# ---------------------------------------------------------------------------
+
+def make_demo_patient(cols, n=170):
+    col_hr, col_spo2, col_patient, col_time = cols
+    t0 = pd.Timestamp("2026-09-05 08:00:00")
+    rows = []
+
+    for i in range(n):
+        p = i / (n - 1)
+
+        def ev(a, b):
+            """Raised-cosine window so events ramp in and out smoothly."""
+            if p < a or p > b:
+                return 0.0
+            return (1 - math.cos((p - a) / (b - a) * 2 * math.pi)) / 2
+
+        hr = 76 + math.sin(i / 11) * 3
+        spo2 = 97.5 + math.cos(i / 9) * 0.8
+
+        # Two-stage deterioration: a compound event, then frank hypoxia.
+        spo2 -= ev(0.28, 0.60) * 6.5 + ev(0.62, 0.95) * 10.0
+        hr += ev(0.30, 0.62) * 30 + ev(0.64, 0.96) * 48
+
+        if i in (44, 45):                       # probe falls off briefly
+            hr_v, spo2_v = None, None
+        else:
+            hr_v = int(round(min(max(hr, 30), 190)))
+            spo2_v = round(min(spo2, 100.0), 1)
+
+        r = classify_vitals(hr_v, spo2_v)
+        rows.append({
+            col_patient: DEMO_ID,
+            col_time: t0 + pd.Timedelta(minutes=i),
+            col_hr: hr_v,
+            col_spo2: spo2_v,
+            "alert_status": r["status"],
+            "alert_triggers": r["triggers"],
+        })
+
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -228,14 +330,14 @@ def detect_column(df, key):
 
 
 @st.cache_data(show_spinner="Loading and scoring patient data...")
-def load_and_score(file_or_path, cols):
+def load_and_score(file_or_path, cols, row_limit):
     """
     Read the dataset, clean it, and run every reading through the alert engine.
 
     Cached so that scoring happens once per file rather than on every
     interaction -- Streamlit re-executes the whole script on each widget change.
     """
-    df = pd.read_csv(file_or_path)
+    df = pd.read_csv(file_or_path, nrows=row_limit)
 
     col_hr, col_spo2, col_patient, col_time = cols
 
@@ -279,6 +381,17 @@ if source is None:
         )
         st.stop()
 
+row_limit = st.sidebar.number_input(
+    "Rows to score", min_value=1000, max_value=200000, value=20000, step=1000,
+    help="Scoring the whole file can be slow. Lower this if the app feels sluggish.",
+)
+
+add_demo = st.sidebar.checkbox(
+    "Add demo crisis patient", value=True,
+    help="Adds one synthetic deteriorating patient so the Priority 1 alert path "
+         "can be demonstrated. Not part of the source dataset.",
+)
+
 # Peek at the header row to detect columns before the full (cached) load
 preview = pd.read_csv(source, nrows=5)
 if uploaded is not None:
@@ -300,12 +413,17 @@ with st.sidebar.expander("Column mapping", expanded=any(v is None for v in detec
     col_patient = picker("Patient ID", "patient")
     col_time = picker("Timestamp", "time")
 
-df = load_and_score(source, (col_hr, col_spo2, col_patient, col_time))
+cols = (col_hr, col_spo2, col_patient, col_time)
+df = load_and_score(source, cols, int(row_limit))
+real_rows = len(df)
+
+if add_demo:
+    df = pd.concat([df, make_demo_patient(cols)], ignore_index=True)
 
 st.sidebar.divider()
 st.sidebar.subheader("Patient")
 
-patient_ids = sorted(df[col_patient].unique())
+patient_ids = sorted(df[col_patient].unique(), key=str)
 
 # Surface the patients in trouble first -- on a real ward nobody scrolls a
 # dropdown of 200 stable patients looking for the one who is deteriorating.
@@ -326,9 +444,11 @@ if st.sidebar.checkbox("Show only patients with alerts", value=bool(p1_counts)):
 else:
     shown = patient_ids
 
+default_index = shown.index(DEMO_ID) if DEMO_ID in shown else 0
 selected = st.sidebar.selectbox(
     "Patient ID",
     shown,
+    index=default_index,
     format_func=patient_label,
 )
 
@@ -354,6 +474,7 @@ if st.session_state.get("current_patient") != selected:
 
 st.session_state.setdefault("idx", n_readings - 1)
 st.session_state.setdefault("playing", False)
+st.session_state.idx = min(st.session_state.idx, max(n_readings - 1, 0))
 
 mode = st.sidebar.radio(
     "Mode",
@@ -361,7 +482,13 @@ mode = st.sidebar.radio(
     help="Live replay streams the patient's readings one at a time.",
 )
 
-if mode == "Live replay":
+speed = 2
+
+# A patient with a single reading has no timeline to replay. Datasets that
+# carry one row per patient ID - which is common - hit this for every real
+# patient, so the controls have to degrade instead of erroring: a slider whose
+# min equals its max is rejected by Streamlit.
+if mode == "Live replay" and n_readings > 1:
     c1, c2 = st.sidebar.columns(2)
     if c1.button("Play" if not st.session_state.playing else "Pause",
                  use_container_width=True):
@@ -373,16 +500,24 @@ if mode == "Live replay":
         st.rerun()
 
     st.session_state.idx = st.sidebar.slider(
-        "Reading", 0, max(n_readings - 1, 0), st.session_state.idx
+        "Reading", 0, n_readings - 1, st.session_state.idx
     )
     speed = st.sidebar.select_slider(
         "Speed", options=[0.5, 1, 2, 4, 8], value=2,
         format_func=lambda s: f"{s}x",
     )
     cursor = st.session_state.idx
+elif mode == "Live replay":
+    st.session_state.playing = False
+    st.session_state.idx = 0
+    cursor = 0
+    st.sidebar.info(
+        "This patient has only one reading, so there is no timeline to replay. "
+        "Pick the demo crisis patient to see the live monitor."
+    )
 else:
     st.session_state.playing = False
-    cursor = n_readings - 1
+    cursor = max(n_readings - 1, 0)
 
 st.sidebar.divider()
 with st.sidebar.expander("Active thresholds"):
@@ -414,6 +549,74 @@ m2.metric("Readings scored", f"{len(df):,}")
 m3.metric("Priority 1 events", f"{int(ward.get(PRIORITY_1, 0)):,}")
 m4.metric("Patients in alert", f"{len(p1_counts):,}")
 
+
+# ---------------------------------------------------------------------------
+# Dataset profile
+#
+# A dataset with no alerts and a broken column mapping look identical from the
+# ward summary alone - both show zero. Printing the actual value ranges tells
+# the two apart.
+# ---------------------------------------------------------------------------
+
+real_df = df[df[col_patient] != DEMO_ID]
+real_p1 = int((real_df["alert_status"] == PRIORITY_1).sum())
+
+with st.expander("Dataset profile", expanded=(real_p1 == 0)):
+    st.caption(
+        f"Statistics for the loaded file only ({real_rows:,} rows). "
+        "The demo patient is excluded."
+    )
+
+    p1, p2, p3 = st.columns(3)
+
+    hr_series = pd.to_numeric(real_df[col_hr], errors="coerce").dropna()
+    sp_series = pd.to_numeric(real_df[col_spo2], errors="coerce").dropna()
+
+    with p1:
+        st.markdown("**Heart rate**")
+        if len(hr_series):
+            st.write(f"min {hr_series.min():.1f} bpm")
+            st.write(f"max {hr_series.max():.1f} bpm")
+            st.write(f"mean {hr_series.mean():.1f} bpm")
+        else:
+            st.write("no values")
+
+    with p2:
+        st.markdown("**Oxygen saturation**")
+        if len(sp_series):
+            st.write(f"min {sp_series.min():.1f}%")
+            st.write(f"max {sp_series.max():.1f}%")
+            st.write(f"mean {sp_series.mean():.1f}%")
+        else:
+            st.write("no values")
+
+    with p3:
+        st.markdown("**Alert states**")
+        counts = real_df["alert_status"].value_counts()
+        total = max(len(real_df), 1)
+        for state in (PRIORITY_1, WARNING, DATA_ERROR, NORMAL):
+            n = int(counts.get(state, 0))
+            st.write(f"{state}: {n:,} ({100 * n / total:.2f}%)")
+
+    if real_p1 == 0:
+        hr_ok = len(hr_series) and 30 <= hr_series.min() and hr_series.max() <= 250
+        sp_ok = len(sp_series) and 50 <= sp_series.min() and sp_series.max() <= 100
+        if hr_ok and sp_ok:
+            st.info(
+                "**No Priority 1 readings in this dataset.** The value ranges above are "
+                "consistent with real heart rate and saturation figures, so the column "
+                "mapping is correct and this dataset simply contains no readings that "
+                "breach the clinical thresholds. That is a finding worth reporting, not a "
+                "fault. The alert logic is verified by the test suite at the bottom of this "
+                "page, and the demo patient in the sidebar exercises the alert path."
+            )
+        else:
+            st.warning(
+                "**No Priority 1 readings, and the value ranges do not look like vital "
+                "signs.** The columns are probably mapped to the wrong fields - check the "
+                "Column mapping section in the sidebar."
+            )
+
 st.divider()
 
 
@@ -424,6 +627,12 @@ st.divider()
 if n_readings == 0:
     st.warning("No readings for this patient.")
     st.stop()
+
+if selected == DEMO_ID:
+    st.caption(
+        "Showing the synthetic demo patient - generated to exercise the alert rules, "
+        "not part of the source dataset. Uncheck it in the sidebar to hide it."
+    )
 
 row = patient_df.iloc[cursor]
 hr_now = row[col_hr]
@@ -639,6 +848,28 @@ else:
         f"{int(counts.get(WARNING, 0))} Warning - "
         f"{int(counts.get(DATA_ERROR, 0))} Sensor fault"
     )
+
+
+# ---------------------------------------------------------------------------
+# Alert engine self-test
+# ---------------------------------------------------------------------------
+
+st.divider()
+st.subheader("Alert engine self-test")
+st.caption(
+    "The 18 cases from Week 2, run against the same classify_vitals() function "
+    "driving this dashboard. Boundary cases are included because the difference "
+    "between '> 120' and '>= 120' is invisible in ordinary data but would "
+    "misclassify every patient sitting exactly on the threshold."
+)
+
+if st.button("Run 18 tests"):
+    results, passed, total = run_test_suite()
+    if passed == total:
+        st.success(f"{passed} / {total} passing")
+    else:
+        st.error(f"{passed} / {total} passing - {total - passed} FAILED")
+    st.dataframe(results, use_container_width=True, hide_index=True)
 
 st.caption(
     "Prototype for educational use. Thresholds assume a general adult population "
